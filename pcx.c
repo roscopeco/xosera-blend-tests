@@ -20,13 +20,15 @@
 #include "xosera_m68k_api.h"
 #include "dprint.h"
 
-bool pcx_load_palette(uint8_t *buf) {
+bool pcx_load_palette(uint8_t *palette_buf) {
+    uint8_t *buf = palette_buf;
     if (*buf++ != 0x0C) {
         dprintf("ERROR: Palette indicator not present");
         return false;
     } else {
         xm_setw(XR_ADDR, XR_COLOR_MEM);
 
+        // PA Palette
         for (int i = 0; i < 256; i++) {
             uint16_t entry = 0;
 
@@ -34,8 +36,24 @@ bool pcx_load_palette(uint8_t *buf) {
             entry |= (*buf++ & 0xF0);
             entry |= ((*buf++ & 0xF0) >> 4);
 
-#ifdef TRACE_DEBUG
-            dprintf("Palette %3d: 0x%04x\n", i, entry);
+#ifdef PALETTE_DEBUG
+            dprintf("PA Palette %3d: 0x%04x\n", i, entry);
+#endif
+
+            xm_setw(XR_DATA, entry);
+        }
+
+        buf = palette_buf + 1; /* +1 to skip identifier byte */
+        // PB Palette
+        for (int i = 0; i < 256; i++) {            
+            uint16_t entry = i == 0 ? 0x0 : 0xC000;
+
+            entry |= ((*buf++ & 0xF0) << 4);
+            entry |= (*buf++ & 0xF0);
+            entry |= ((*buf++ & 0xF0) >> 4);
+
+#ifdef PALETTE_DEBUG
+            dprintf("PB Palette %3d: 0x%04x\n", i, entry);
 #endif
 
             xm_setw(XR_DATA, entry);
@@ -69,7 +87,8 @@ static inline void draw(uint8_t pix) {
  */
 uint8_t* pcx_draw_image(uint16_t xpos, uint16_t ypos, uint16_t width, uint16_t height, uint16_t vram_base, uint8_t *buf) {
     uint16_t ystart = vram_base + (ypos * 160);
-    uint16_t xpwords = xpos / 2;
+    uint16_t xpwords = xpos >> 1;
+    uint8_t *start_buf = buf;
 
     dprintf("   YSTART: %d\n", ystart);
 
@@ -91,7 +110,12 @@ uint8_t* pcx_draw_image(uint16_t xpos, uint16_t ypos, uint16_t width, uint16_t h
                 // Do a run
                 uint8_t len = pix & 0x3f;
                 pix = *buf++;
-                
+
+#ifdef TRACE_DEBUG
+                dprintf("(X,Y) = (%d,%d) : Start run value %d (length %d)\n",
+                    x, y, pix, len);
+#endif
+
                 for (uint8_t j = 0; j < len; j++) {
                     draw(pix);
                 }
@@ -104,56 +128,9 @@ uint8_t* pcx_draw_image(uint16_t xpos, uint16_t ypos, uint16_t width, uint16_t h
         }
     }
 
+    dprintf("Drew %ld pixels", ((uint32_t)(buf - start_buf)));
+
+    high = false; /* reset this for next draw */
+
     return buf;
 }
-
-
-/*
-
-bool show_pcx(uint32_t buf_size, uint8_t *buf) {
-    if (buf_size < 128) {
-        dprintf("ERROR: Buffer is too small\n");
-        return false;
-    } else {
-        PCXHeader *hdr = (PCXHeader*)buf;
-
-        uint16_t width  = swap(hdr->max_x) - swap(hdr->min_x) + 1;
-        uint16_t height = swap(hdr->max_y) - swap(hdr->min_y) + 1;  
-
-        // *very* basic checks
-        if (width != 320 || height != 240 || hdr->bpp != 8 || hdr->num_planes != 1 || hdr->encoding != 1) {
-            dprintf("ERROR: Bad image\n");
-            return false;
-        }
-
-        dprintf("Header      : 0x%02x\n", hdr->header);
-        dprintf("Version     : 0x%02x\n", hdr->version);
-        dprintf("Encoding    : 0x%02x\n", hdr->encoding);
-        dprintf("BPP         : 0x%02x\n", hdr->bpp);
-        dprintf("Plane count : 0x%02x\n", hdr->num_planes);
-        dprintf("Mode        : %s\n", modes[swap(hdr->palette_mode)]);
-        dprintf("Min X       : %d\n", swap(hdr->min_x));
-        dprintf("Min Y       : %d\n", swap(hdr->min_y));
-        dprintf("Max X       : %d\n", swap(hdr->max_x));
-        dprintf("Max Y       : %d\n", swap(hdr->max_y));
-        dprintf("Dimensions  : %dx%d\n", width, height);
-        dprintf("H DPI       : %d\n", swap(hdr->h_dpi));
-        dprintf("V DPI       : %d\n", swap(hdr->v_dpi));
-        dprintf("\n");
-
-        
-        if (!load_palette(buf + (buf_size - 769))) {
-            dprintf("ERROR: Palette load failed\n");
-            return false;
-        }
-
-        if (!load_image(buf_size - 769 - 128, buf + 128)) {
-            dprintf("ERROR: Image load failed\n");
-            return false;
-        }
-
-        return true;
-    }
-}
-
-*/

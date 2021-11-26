@@ -8,12 +8,13 @@
  *                     |_____|
  * ------------------------------------------------------------
  * Copyright (c) 2021 Ross Bamford
- * Heavily based on (and portions reproduced from) Xark's 
- * xosera_test_m68k. Copyright (c) 2021 Xark
+ * 
+ * Portions reproduced from Xark's xosera_test_m68k. 
+ * Copyright (c) 2021 Xark
  *
  * MIT License
  *
- * Full-screen half frame video tech demo for Xosera
+ * Xosera playfield blend mode experiments
  * ------------------------------------------------------------
  */
 
@@ -37,17 +38,18 @@
  */
 
 // Directory on SD card containing frames with filenames like "0001.xmb".
-// The files must be consecutive, and start at 1. A maximum of 30 will be
-// loaded.
+// The files must be consecutive, and start at 1. A maximum of MAX_FRAMES
+// will be loaded.
+//
 // WARNING: Max 9 characters!
 #define FRAME_DIR   "xotext"
 
-// Sets the (starting, if effects are used) attribute to draw the animation.
-// High nybble is foreground, low is background
+// Sets the (starting, if effects are used) attribute to draw the animations
+// in 1bpp modes. High nybble is foreground, low is background
 #define ATTR        0x0F
 
 // One of the following two may be defined for "effects"
-#define SLOW_CYCLE                // Define to slowly cycle normal/inverse
+//#define SLOW_CYCLE                // Define to slowly cycle normal/inverse
 //#define PSYCHEDELIC               // Define to quickly cycle colours
 
 /*
@@ -65,8 +67,19 @@
 #define PA_BUF_1    0x4b00
 
 extern void install_intr();
+extern void remove_intr();
 
 extern void* _end;
+
+// Guards against things being optimized out...
+volatile uint32_t opt_guard = 0;
+
+// These are all accessed by the vblank handler
+volatile uint32_t vblank_count = 0;
+volatile uint16_t current_pa_buf = PA_BUF_0;
+volatile uint16_t back_pa_buf = PA_BUF_1;
+volatile bool pa_flip_needed = false;
+volatile uint16_t pb_gfx_ctrl = 0x0000;
 
 #if !defined(checkchar)        // newer rosco_m68k library addition, this is in case not present
 bool checkchar() {
@@ -84,8 +97,9 @@ bool checkchar() {
 }
 #endif
 
-// Call when in 320x200 bitmap mode!
+// Clear a chunk of VRAM
 static void xcls(uint16_t vaddr, uint16_t len) {
+    // TODO blitter
     xm_setw(WR_ADDR, vaddr);
     xm_setw(WR_INCR, 1);
     xm_setbh(DATA, 0);
@@ -94,40 +108,6 @@ static void xcls(uint16_t vaddr, uint16_t len) {
         xm_setbl(DATA, 0);
     }
     xm_setw(WR_ADDR, 0);
-}
-
-static void xmsg(int x, int y, int color, const char * msg) {
-    xm_setw(WR_ADDR, (y * 80) + x);
-    xm_setbh(DATA, color);
-    char c;
-    while ((c = *msg++) != '\0') {
-        xm_setbl(DATA, c);
-    }
-}
-
-static uint16_t rosco_m68k_CPUMHz() {
-    uint32_t count;
-    uint32_t tv;
-    __asm__ __volatile__(
-        "   moveq.l #0,%[count]\n"
-        "   move.w  _TIMER_100HZ+2.w,%[tv]\n"
-        "0: cmp.w   _TIMER_100HZ+2.w,%[tv]\n"
-        "   beq.s   0b\n"
-        "   move.w  _TIMER_100HZ+2.w,%[tv]\n"
-        "1: addq.w  #1,%[count]\n"                   //   4  cycles
-        "   cmp.w   _TIMER_100HZ+2.w,%[tv]\n"        //  12  cycles
-        "   beq.s   1b\n"                            // 10/8 cycles (taken/not)
-        : [count] "=d"(count), [tv] "=&d"(tv)
-        :
-        :);
-    uint16_t MHz = ((count * 26) + 500) / 1000;
-    dprintf("rosco_m68k: m68k CPU speed %d.%d MHz (%d.%d BogoMIPS)\n",
-            MHz / 10,
-            MHz % 10,
-            count * 3 / 10000,
-            ((count * 3) % 10000) / 10);
-
-    return (MHz + 5) / 10;
 }
 
 static uint32_t load_sd_file(const char *filename, uint8_t *buffer) {
@@ -151,7 +131,7 @@ static uint32_t load_sd_file(const char *filename, uint8_t *buffer) {
     return 0;
 }
 
-static void draw_sd_mono_bitmap(uint16_t vaddr, uint8_t *buffer, uint32_t size, uint8_t attr) {
+static void draw_mono_bitmap(uint16_t vaddr, uint8_t *buffer, uint32_t size, uint8_t attr) {
     xm_setw(WR_ADDR, vaddr);
     xm_setbh(DATA, attr);
 
@@ -177,9 +157,9 @@ static uint8_t load_frames(uint8_t *buffer) {
 
     for (int i = 0; i < MAX_FRAMES; i++) {
         if ((xm_getbl(UNUSED_A) & 0xF) > 3) {
-            xreg_setw(PB_GFX_CTRL, 0x0065);
+            pb_gfx_ctrl = 0x0065;
         } else {
-            xreg_setw(PB_GFX_CTRL, 0x00E5);
+            pb_gfx_ctrl = 0x00E5;
         }
 
         if (sprintf(strbuf, "/" FRAME_DIR "/%04d.xmb", i + 1) < 0) {
@@ -202,6 +182,14 @@ static uint8_t load_frames(uint8_t *buffer) {
     return MAX_FRAMES;
 }
 
+/* Wait until at least one vblank has run */
+static void wait_vblank() {
+    uint32_t vblank_start = vblank_count;
+    do {
+        opt_guard++;
+    } while (vblank_count == vblank_start);
+}
+
 /**
  * Start the "Loading" sequence. Loads the "Loading" image
  * and the overlay, and draws them to the relevant playfields.
@@ -210,22 +198,8 @@ static uint8_t load_frames(uint8_t *buffer) {
  * the function, and can be reused after this returns.
  */
 static bool start_loading(uint8_t *temp_buffer) {
-    xreg_setw(PA_GFX_CTRL, 0x0000);
-    xreg_setw(PA_LINE_LEN, 80);
-
-    xmsg(10, 80, 10, "Loading");
-    
     uint32_t size;
     if ((size = load_sd_file("/" FRAME_DIR "/Disk.pcx", temp_buffer))) {
-        xreg_setw(PA_GFX_CTRL, 0x0065);
-        xreg_setw(PA_LINE_LEN, 160);
-
-        xreg_setw(PB_GFX_CTRL, 0x0065);
-        xreg_setw(PB_LINE_LEN, 160);
-
-        xreg_setw(PA_DISP_ADDR, PA_8BPP);
-        xreg_setw(PB_DISP_ADDR, PB_8BPP);
-
         xcls(PA_8BPP, 38400);
         xcls(PB_8BPP, 27136);
 
@@ -235,7 +209,19 @@ static bool start_loading(uint8_t *temp_buffer) {
         uint8_t *overlay_start = pcx_draw_image(8, 85, 304, 70, PA_8BPP, PCX_PIXELS(temp_buffer));
 
         // Draw overlay on PB
-        pcx_draw_image(20, 132, 304, 10, PB_8BPP, overlay_start);
+        pcx_draw_image(8, 132, 304, 10, PB_8BPP, overlay_start);
+
+        // Enable playfield displays
+        xreg_setw(PA_GFX_CTRL, 0x0065);
+        xreg_setw(PA_LINE_LEN, 160);
+
+        pb_gfx_ctrl = 0x0065;
+        xreg_setw(PB_LINE_LEN, 160);
+
+        xreg_setw(PA_DISP_ADDR, PA_8BPP);
+        xreg_setw(PB_DISP_ADDR, PB_8BPP);
+
+        wait_vblank();
 
         return true;
     } else {
@@ -246,14 +232,9 @@ static bool start_loading(uint8_t *temp_buffer) {
 
 static void done_loading() {
     // Just blank PB for now...
-    xreg_setw(PB_GFX_CTRL, 0x00E5);
+    pb_gfx_ctrl = 0x00E5;
+    wait_vblank();
 }
-
-volatile uint32_t vblank_count = 0;
-volatile uint16_t current_pa_buf = PA_BUF_0;
-volatile uint16_t back_pa_buf = PA_BUF_1;
-volatile bool pa_flip_needed = false;
-volatile uint32_t opt_guard = 0;
 
 void xosera_demo() {
     // flush any input charaters to avoid instant exit
@@ -289,17 +270,12 @@ void xosera_demo() {
     bool success = xosera_init(0);
     dprintf("%s (%dx%d)\n", success ? "succeeded" : "FAILED", xreg_getw(VID_HSIZE), xreg_getw(VID_VSIZE));
 
-    rosco_m68k_CPUMHz();
     xm_setw(WR_INCR, 1);    
 
     uint8_t *buffer = (uint8_t*)&_end;
     uint8_t frame_count;
 
-    xmsg(1,  2, 0x9, "Video");
-    xmsg(7,  2, 0xA, "Tech");
-    xmsg(12, 2, 0xC, "Demo");
-    xmsg(17, 2, 0xB, "by");
-    xmsg(20, 2, 0xE, "@roscopeco");
+    install_intr();
 
     dprintf("Loading loading image\n");
 
@@ -313,8 +289,6 @@ void xosera_demo() {
         dprintf("Loaded %d frames\n", frame_count);
 
         done_loading();
-
-        install_intr();
 
         xreg_setw(PA_GFX_CTRL, 0x0045);
         xreg_setw(PA_LINE_LEN, 40);
@@ -332,7 +306,7 @@ void xosera_demo() {
                 bufptr = buffer;
             }
 
-            draw_sd_mono_bitmap(back_pa_buf, bufptr, FRAME_SIZE, attr);
+            draw_mono_bitmap(back_pa_buf, bufptr, FRAME_SIZE, attr);
             pa_flip_needed = true;
 
             int count = 0;
@@ -386,6 +360,8 @@ void xosera_demo() {
         }
     } else {
         printf("Load failed; No frames :(\n");
+        done_loading();
+        remove_intr();
     }
 }
 
