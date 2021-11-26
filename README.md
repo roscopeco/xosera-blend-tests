@@ -1,28 +1,16 @@
-# Full-screen, half-frame video tech demo for Xosera
+# Demo using playfields A and B and various blend modes
 
-This is a simple, naive, and brute-force full-screen video
-test/demo for Xark's Xosera on rosco_m68k.
+This is a simple test/demo of dual playfield blending for 
+Xark's Xosera on rosco_m68k.
 
 https://github.com/XarkLabs/Xosera
 
-Much of the code herein is either written by Xark, or 
-heavily based on Xark's code. Portions copyright 
-2021 Xark, other portions copyright 2021 Ross Bamford.
-
-The `logo-ball` animation is original work. 
-
-The `walk` animation comes from an uncredited GIF I 
-found on the Internet. If it belongs to you and you'd
-like credit, or want it removed, please get in touch 
-with Ross Bamford.
+All graphic assets (in `assets` directory) are original work.
 
 There's a utility (in the `utils` directory) that converts
 individual PNGs into the individual frame XMBs expected
 by the demo. These should be named e.g. `0001.xmb`, `0002.xmb`
-etc and placed in a directory on your SD card (the directory
-is configurable in the main C file, but by default should be
-`/walk`). A maximum of 30 frames will be loaded (due to
-memory constraints).
+etc and placed in the appropriate directory on your SD card.
 
 It's recommended to pre-process your PNGs to add dithering
 etc for best results, as the utility will just average the
@@ -39,7 +27,7 @@ spread over a couple of days...
 ROSCO_M68K_DIR=/path/to/rosco_m68k make clean all
 ```
 
-This will build `myprogram.bin`, which can be uploaded to a board that
+This will build `xosera-blend-demo.bin`, which can be uploaded to a board that
 is running the `serial-receive` firmware.
 
 If you're feeling adventurous (and have ckermit installed), you
