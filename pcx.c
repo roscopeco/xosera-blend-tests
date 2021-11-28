@@ -20,7 +20,7 @@
 #include "xosera_m68k_api.h"
 #include "dprint.h"
 
-bool pcx_load_palette(uint8_t *palette_buf) {
+bool pcx_load_palette(uint8_t *palette_buf, uint8_t pb_transparent_idx, uint16_t pa_base, uint16_t pb_base) {
     uint8_t *buf = palette_buf;
     if (*buf++ != 0x0C) {
         dprintf("ERROR: Palette indicator not present");
@@ -30,7 +30,7 @@ bool pcx_load_palette(uint8_t *palette_buf) {
 
         // PA Palette
         for (int i = 0; i < 256; i++) {
-            uint16_t entry = 0;
+            uint16_t entry = pa_base;
 
             entry |= ((*buf++ & 0xF0) << 4);
             entry |= (*buf++ & 0xF0);
@@ -46,7 +46,7 @@ bool pcx_load_palette(uint8_t *palette_buf) {
         buf = palette_buf + 1; /* +1 to skip identifier byte */
         // PB Palette
         for (int i = 0; i < 256; i++) {            
-            uint16_t entry = i == 0 ? 0x0 : 0xC000;
+            uint16_t entry = i == pb_transparent_idx ? 0x0 : pb_base;
 
             entry |= ((*buf++ & 0xF0) << 4);
             entry |= (*buf++ & 0xF0);
@@ -63,10 +63,10 @@ bool pcx_load_palette(uint8_t *palette_buf) {
     }
 }
 
-static bool high = false;
-static uint16_t save_pix = 0;
-
 static inline void draw(uint8_t pix) {
+    static bool high = false;
+    static uint16_t save_pix = 0;
+
     if (high) {
         // send to Xosera
         xm_setw(DATA, save_pix << 8 | pix);
@@ -79,7 +79,8 @@ static inline void draw(uint8_t pix) {
 
 /**
  * NOTE: Image width and height must be even, and buffer is not bounds-checked!
- * Only supports 320x240
+ * Only supports 320x240 mode, Image must be even number of pixels in both
+ * dimensions or weirdness will result.
  * 
  * Returns pointer to next pixel *after* end of the drawn image.
  * 
@@ -88,19 +89,17 @@ static inline void draw(uint8_t pix) {
 uint8_t* pcx_draw_image(uint16_t xpos, uint16_t ypos, uint16_t width, uint16_t height, uint16_t vram_base, uint8_t *buf) {
     uint16_t ystart = vram_base + (ypos * 160);
     uint16_t xpwords = xpos >> 1;
-    uint8_t *start_buf = buf;
 
+#ifdef TRACE_DEBUG
+    uint8_t *start_buf = buf;
     dprintf("   YSTART: %d\n", ystart);
+#endif
 
     for (uint16_t y = 0; y < height; y++) {
         uint16_t linestart = ystart + (y * 160) + xpwords;
+#ifdef TRACE_DEBUG
         dprintf("   LSTART: %d (Line %d)\n", linestart, y);
-
-        if (high) {
-            dprintf("WARN: Last pixel not sent!\n");
-            high = false;
-        }
-
+#endif
         xm_setw(WR_ADDR, linestart);
 
         for (int x = 0; x < width; x++) {
@@ -128,9 +127,9 @@ uint8_t* pcx_draw_image(uint16_t xpos, uint16_t ypos, uint16_t width, uint16_t h
         }
     }
 
+#ifdef TRACE_DEBUG
     dprintf("Drew %ld pixels", ((uint32_t)(buf - start_buf)));
-
-    high = false; /* reset this for next draw */
+#endif
 
     return buf;
 }

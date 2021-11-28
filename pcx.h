@@ -67,5 +67,5 @@ inline uint8_t* PCX_PIXELS(uint8_t *buf) {
     return buf + 128;
 }
 
-bool pcx_load_palette(uint8_t *palette_start);
+bool pcx_load_palette(uint8_t *palette_start, uint8_t pb_transparent_idx, uint16_t pa_base, uint16_t pb_base);
 uint8_t* pcx_draw_image(uint16_t xpos, uint16_t ypos, uint16_t width, uint16_t height, uint16_t vram_base, uint8_t *pixels_start);

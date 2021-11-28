@@ -43,20 +43,25 @@ Xosera_intr:
                 move.l  #XM_BASEADDR,A0         ; Get Xosera base addr
                 movep.w XM_XR_ADDR(A0),D2       ; save aux_addr value
 
+                ; move.w  pa_gfx_ctrl,D0          ; Get requested PA GFX_CTRL
+                ; move.w  #XR_PA_GFX_CTRL,D1      ; And set in Xosera
+                ; movep.w D1,XM_XR_ADDR(A0)
+                ; movep.w D0,XM_XR_DATA(A0)                
+
                 move.w  pb_gfx_ctrl,D0          ; Get requested PB GFX_CTRL
                 move.w  #XR_PB_GFX_CTRL,D1      ; And set in Xosera
                 movep.w D1,XM_XR_ADDR(A0)
                 movep.w D0,XM_XR_DATA(A0)                
 
-                tst.b   pa_flip_needed          ; Buffer flip needed?
+                tst.b   pb_flip_needed          ; Buffer flip needed?
                 beq.s   .DONE                   ; Done if not...
 
-                move.w  back_pa_buf,D0          ; Else, swap the buffers...
-                move.w  current_pa_buf,back_pa_buf
-                move.w  D0,current_pa_buf
-                clr.b   pa_flip_needed          ; ... and reset the flag.
+                move.w  back_pb_buf,D0          ; Else, swap the buffers...
+                move.w  current_pb_buf,back_pb_buf
+                move.w  D0,current_pb_buf
+                clr.b   pb_flip_needed          ; ... and reset the flag.
 
-                move.w  #XR_PA_DISP_ADDR,D1     ; Inform Xosera about the change
+                move.w  #XR_PB_DISP_ADDR,D1     ; Inform Xosera about the change
                 movep.w D1,XM_XR_ADDR(A0)
                 movep.w D0,XM_XR_DATA(A0)
 
@@ -68,6 +73,6 @@ Xosera_intr:
                 movem.l (A7)+,D0-D2/A0
 
                 addi.l  #1,vblank_count         ; Increment vblank counter (used for waits)
-                
+
                 rte
 

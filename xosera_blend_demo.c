@@ -30,8 +30,13 @@
 #include <sdfat.h>
 
 #include "xosera_m68k_api.h"
+#include "xosera_primitives.h"
 #include "dprint.h"
 #include "pcx.h"
+
+#define GFX_MODE_8BPPX2         0x0065
+#define GFX_MODE_8BPPX2_BLANK   0x00E5
+#define GFX_MODE_1BPPX2         0x0045
 
 /*
  * Options - Change these to suit your tastes
@@ -62,23 +67,40 @@
 #define PA_8BPP     0
 #define PB_8BPP     0x9600
 
-/* Double buffers for PA in 1bpp mode */
-#define PA_BUF_0    0
-#define PA_BUF_1    0x4b00
+/* Double buffers for PB in 1bpp mode */
+#define PB_BUF_0    0
+#define PB_BUF_1    0x4b00
+
+/* Single buffer for PA in 8bpp mode, 320x168 lines due to VRAM limits */
+#define PA_BUF      0x9600
+/* 320 * 168 == 53760 bytes == 26880 / 0x6900 words */
+#define PA_LEN      0x6900
 
 extern void install_intr();
 extern void remove_intr();
 
 extern void* _end;
 
+/* copper list */
+uint16_t copper_list_size = 5;
+const uint32_t copper_list[] = {
+    COP_WAIT_V(72),                                     // wait  0, 72                   ; Wait for line 40, H position ignored
+    COP_MOVER(GFX_MODE_8BPPX2, PA_GFX_CTRL),            // mover 0x0065, PA_GFX_CTRL     ; Set to 8-bpp + Hx2 + Vx2
+    COP_WAIT_V(408),                                    // wait  0, 408                  ; Wait for line 440, H position ignored
+    COP_MOVER(GFX_MODE_8BPPX2_BLANK, PA_GFX_CTRL),      // mover 0x00E5, PA_GFX_CTRL     ; Set to Blank + 8-bpp + Hx2 + Vx2
+    COP_END()                                           // nextf
+};
+
 // Guards against things being optimized out...
 volatile uint32_t opt_guard = 0;
 
 // These are all accessed by the vblank handler
 volatile uint32_t vblank_count = 0;
-volatile uint16_t current_pa_buf = PA_BUF_0;
-volatile uint16_t back_pa_buf = PA_BUF_1;
-volatile bool pa_flip_needed = false;
+volatile uint16_t current_pb_buf = PB_BUF_0;
+volatile uint16_t back_pb_buf = PB_BUF_1;
+volatile bool pb_flip_needed = false;
+
+// Interrupt handler uses these to sync GFX_CTRL changes to VBLANK...
 volatile uint16_t pb_gfx_ctrl = 0x0000;
 
 #if !defined(checkchar)        // newer rosco_m68k library addition, this is in case not present
@@ -97,17 +119,35 @@ bool checkchar() {
 }
 #endif
 
-// Clear a chunk of VRAM
-static void xcls(uint16_t vaddr, uint16_t len) {
+// Clear a chunk of VRAM with specified value
+static void xcls(uint16_t vaddr, uint16_t len, uint16_t val) {
     // TODO blitter
     xm_setw(WR_ADDR, vaddr);
     xm_setw(WR_INCR, 1);
-    xm_setbh(DATA, 0);
+    xm_setbh(DATA, (val & 0xFF00) >> 8);
+    uint8_t bl = val & 0x00FF;
 
     for (uint16_t i = 0; i < len; i++) {
-        xm_setbl(DATA, 0);
+        xm_setbl(DATA, bl);
     }
     xm_setw(WR_ADDR, 0);
+}
+
+static void load_copper_list(uint16_t len, const uint32_t *list) {
+    xm_setw(XR_ADDR, XR_COPPER_MEM);
+
+    for (uint8_t i = 0; i < len; i++) {
+        xm_setw(XR_DATA, list[i] >> 16);
+        xm_setw(XR_DATA, list[i] & 0xffff);
+    }
+}
+
+static void enable_copper() {
+    xreg_setw(COPP_CTRL, 0x8000);
+}
+
+static void disable_copper() {
+    xreg_setw(COPP_CTRL, 0x0000);
 }
 
 static uint32_t load_sd_file(const char *filename, uint8_t *buffer) {
@@ -157,9 +197,9 @@ static uint8_t load_frames(uint8_t *buffer) {
 
     for (int i = 0; i < MAX_FRAMES; i++) {
         if ((xm_getbl(UNUSED_A) & 0xF) > 3) {
-            pb_gfx_ctrl = 0x0065;
+            pb_gfx_ctrl = GFX_MODE_8BPPX2;
         } else {
-            pb_gfx_ctrl = 0x00E5;
+            pb_gfx_ctrl = GFX_MODE_8BPPX2_BLANK;
         }
 
         if (sprintf(strbuf, "/" FRAME_DIR "/%04d.xmb", i + 1) < 0) {
@@ -200,10 +240,13 @@ static void wait_vblank() {
 static bool start_loading(uint8_t *temp_buffer) {
     uint32_t size;
     if ((size = load_sd_file("/" FRAME_DIR "/Disk.pcx", temp_buffer))) {
-        xcls(PA_8BPP, 38400);
-        xcls(PB_8BPP, 27136);
+        xcls(PA_8BPP, 38400, 0);
+        xcls(PB_8BPP, 27136, 0);
 
-        pcx_load_palette(PCX_PALETTE(size, temp_buffer));
+        if (!pcx_load_palette(PCX_PALETTE(size, temp_buffer), 0, 0, 0xC000)) {
+            dprintf("Failed to load loading palette!\n");
+            return false;
+        }
 
         // Draw main image on PA
         uint8_t *overlay_start = pcx_draw_image(8, 85, 304, 70, PA_8BPP, PCX_PIXELS(temp_buffer));
@@ -212,10 +255,10 @@ static bool start_loading(uint8_t *temp_buffer) {
         pcx_draw_image(8, 132, 304, 10, PB_8BPP, overlay_start);
 
         // Enable playfield displays
-        xreg_setw(PA_GFX_CTRL, 0x0065);
+        xreg_setw(PA_GFX_CTRL, GFX_MODE_8BPPX2);
         xreg_setw(PA_LINE_LEN, 160);
 
-        pb_gfx_ctrl = 0x0065;
+        pb_gfx_ctrl = GFX_MODE_8BPPX2;
         xreg_setw(PB_LINE_LEN, 160);
 
         xreg_setw(PA_DISP_ADDR, PA_8BPP);
@@ -231,36 +274,90 @@ static bool start_loading(uint8_t *temp_buffer) {
 }
 
 static void done_loading() {
-    // Just blank PB for now...
-    pb_gfx_ctrl = 0x00E5;
+    // Just clear and blank PA for now...
+    xcls(PA_BUF, PA_LEN, 0);
+    xreg_setw(PA_DISP_ADDR, PA_BUF);
+    // xreg_setw(PA_GFX_CTRL, GFX_MODE_8BPPX2_BLANK);
     wait_vblank();
+}
+
+static void random_pa_line() {
+    uint8_t color = xm_getbl(UNUSED_A) & 0x7F;
+    uint16_t x0 = xm_getw(UNUSED_A) % 319;
+    uint16_t y0 = xm_getw(UNUSED_A) % 167; 
+    uint16_t x1 = xm_getw(UNUSED_A) % 319;
+    uint16_t y1 = xm_getw(UNUSED_A) % 167; 
+
+#ifdef LINE_TRACE
+    dprintf("Drawing line: (%d,%d),(%d,%d) [color: 0x%02x]\n", x0, y0, x1, y1, color);
+#endif
+
+    xosera_line(x0, y0, x1, y1, color, PA_BUF, plot_320x200_8bpp);
+}
+
+void demo_palette(uint8_t component, uint16_t a_blend, uint16_t b_blend) {
+    xm_setw(XR_ADDR, XR_COLOR_MEM);
+
+    // PA Palette
+    for (int i = 0; i < 256; i++) {
+        uint16_t entry = a_blend;
+
+        if (component == 0) {
+            entry |= ((i & 0xF0) << 4);
+        } else if (component == 1) {
+            entry |= (i & 0xF0);
+        } else {
+            entry |= ((i & 0xF0) >> 4);
+        }
+
+#ifdef PALETTE_DEBUG
+        dprintf("PA Palette %3d: 0x%04x\n", i, entry);
+#endif
+
+        xm_setw(XR_DATA, entry);
+    }
+
+    // PB Palette
+    for (int i = 0; i < 256; i++) {            
+        uint16_t entry = i == ATTR ? 0x0 : b_blend;
+
+        entry |= ((i & 0xF0) << 4);
+        entry |= (i & 0xF0);
+        entry |= ((i & 0xF0) >> 4);
+
+#ifdef PALETTE_DEBUG
+        dprintf("PB Palette %3d: 0x%04x\n", i, entry);
+#endif
+
+        xm_setw(XR_DATA, entry);
+    }
+}
+
+void do_initial_blank() {
+    xcls(0, 3000, 0);
+    xreg_setw(PA_GFX_CTRL, 0x0000);
+    xreg_setw(PB_GFX_CTRL, 0x0000);
+    xreg_setw(PA_DISP_ADDR, 0);
 }
 
 void xosera_demo() {
     // flush any input charaters to avoid instant exit
-    while (checkchar())
-    {
+    while (checkchar()) {
         readchar();
     }
 
-    dprintf("Xosera video demo (m68k)\n");
+    dprintf("Xosera playfield / blend demo (m68k)\n");
 
-    if (SD_check_support())
-    {
+    if (SD_check_support()) {
         dprintf("SD card supported: ");
 
-        if (SD_FAT_initialize())
-        {
+        if (SD_FAT_initialize()) {
             dprintf("card ready\n");
-        }
-        else
-        {
+        } else {
             dprintf("no card; quitting\n");
             return;
         }
-    }
-    else
-    {
+    } else {
         dprintf("No SD card support; quitting.\n");
         return;
     }
@@ -270,7 +367,10 @@ void xosera_demo() {
     bool success = xosera_init(0);
     dprintf("%s (%dx%d)\n", success ? "succeeded" : "FAILED", xreg_getw(VID_HSIZE), xreg_getw(VID_VSIZE));
 
-    xm_setw(WR_INCR, 1);    
+    do_initial_blank();
+
+    dprintf("Loading %d bytes of copper list...\n", copper_list_size);
+    load_copper_list(copper_list_size, copper_list);    
 
     uint8_t *buffer = (uint8_t*)&_end;
     uint8_t frame_count;
@@ -285,13 +385,20 @@ void xosera_demo() {
 
     dprintf("Loading frames...\n");
 
+    uint8_t palette_component = 1;
+    uint8_t anim_cycles = 0;
+
     if ((frame_count = load_frames(buffer))) {
         dprintf("Loaded %d frames\n", frame_count);
 
         done_loading();
+        enable_copper();
+        demo_palette(0, 0x0000, 0xc000);
 
-        xreg_setw(PA_GFX_CTRL, 0x0045);
-        xreg_setw(PA_LINE_LEN, 40);
+        // N.B. From here on out, PA_GFX_CTRL is under control of copper...
+
+        pb_gfx_ctrl = GFX_MODE_1BPPX2;
+        xreg_setw(PB_LINE_LEN, 40);
 
         uint8_t current_frame = frame_count;
         uint8_t *bufptr = buffer;
@@ -300,17 +407,41 @@ void xosera_demo() {
 #endif
         uint8_t attr = ATTR;
 
+#ifdef LINE_TEST
+        xosera_line(0, 0, 319, 0, 127, PA_BUF, plot_320x200_8bpp);
+        xosera_line(0, 167, 319, 167, 127, PA_BUF, plot_320x200_8bpp);
+        xosera_line(0, 0, 0, 167, 127, PA_BUF, plot_320x200_8bpp);
+        xosera_line(319, 0, 319, 167, 127, PA_BUF, plot_320x200_8bpp);
+
+        xosera_line(0, 0, 319, 167, 127, PA_BUF, plot_320x200_8bpp);
+        xosera_line(0, 167, 319, 0, 127, PA_BUF, plot_320x200_8bpp);
+#endif
+
         while (true) {     
             if (current_frame == frame_count) {
+                demo_palette(palette_component++, 0x0000, 0xc000);
+
+                if (palette_component == 3) {
+                    palette_component = 0;
+                }
+
+                if (anim_cycles++ == 10) {
+                    // TODO change palette blend mode here...
+                    xcls(PA_BUF, PA_LEN, 0);
+                }
+
                 current_frame = 0;
                 bufptr = buffer;
             }
 
-            draw_mono_bitmap(back_pa_buf, bufptr, FRAME_SIZE, attr);
-            pa_flip_needed = true;
+            random_pa_line();
+            random_pa_line();
+
+            draw_mono_bitmap(back_pb_buf, bufptr, FRAME_SIZE, attr);
+            pb_flip_needed = true;
 
             int count = 0;
-            while (pa_flip_needed) { 
+            while (pb_flip_needed) { 
                 // wait for flip
                 if (count++ == 100000) {
                     dprintf("Still waiting for flip (after %d vblanks)...\n", vblank_count);
